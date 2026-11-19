@@ -1,3 +1,4 @@
+- Arch with a Unified Kernel Image (GRUB 2.14+ `uki`): the image itself gets the splash, is backed up and put back on an error, and `quiet splash` go into `/etc/kernel/cmdline` when missing.
 - `nirusplash --version` answers without bash (the rest still needs it), so
   NIRUX can check it in minimal containers too.
 

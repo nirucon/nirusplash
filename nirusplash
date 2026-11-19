@@ -20,7 +20,7 @@
 #
 # The first lines are plain sh: --version answers without bash (NIRUX checks
 # every program that way, also in minimal containers); the rest needs bash.
-VERSION=0.1.1
+VERSION=0.1.2
 case "${1:-}" in --version|version) printf 'nirusplash %s\n' "$VERSION"; exit 0 ;; esac
 if [ -z "${BASH_VERSION:-}" ]; then
   command -v bash >/dev/null 2>&1 || { echo 'nirusplash: bash is needed' >&2; exit 1; }
@@ -163,6 +163,30 @@ initramfs_path() {
   esac
 }
 
+# Arch with a Unified Kernel Image (kernel, initramfs and command line in one
+# EFI file that GRUB starts with its `uki` command): the image the preset
+# makes, if it makes one.
+uki_path() {
+  [ "$OS" = arch ] || return 0
+  local base preset
+  base=$(cat "/usr/lib/modules/$1/pkgbase" 2>/dev/null || say linux)
+  preset=/etc/mkinitcpio.d/$base.preset
+  [ -f "$preset" ] || return 0
+  # shellcheck disable=SC1090
+  ( set +u; . "$preset" >/dev/null 2>&1; [ -n "${default_uki:-}" ] && say "$default_uki" ) || :
+}
+
+# Every file the next start reads the initramfs from.
+boot_images() {
+  local img uki
+  img=$(initramfs_path "$1")
+  uki=$(uki_path "$1")
+  [ ! -f "$img" ] || say "$img"
+  [ -z "$uki" ] || say "$uki"
+}
+
+UKI_CMDLINE=/etc/kernel/cmdline
+
 initramfs_list() {
   case "$OS" in
     debian) lsinitramfs "$1" ;;
@@ -175,7 +199,8 @@ initramfs_list() {
 # first match, and under pipefail the lister's SIGPIPE reads as "not found".
 initramfs_has_theme() {
   local img list
-  img=$(initramfs_path "$1")
+  img=$(uki_path "$1")
+  [ -n "$img" ] || img=$(initramfs_path "$1")
   [ -f "$img" ] || return 1
   list=$(initramfs_list "$img") || :
   case "$list" in *plymouth/themes/nirux/nirux.script*) return 0 ;; esac
@@ -364,7 +389,9 @@ regen_grub_cfg() {
   if command -v grub-script-check >/dev/null 2>&1; then
     grub-script-check "$new" >> "$LOG" 2>&1 || { rm -f "$new"; die 'the new grub.cfg did not pass grub-script-check'; }
   fi
-  grep -q '^[[:space:]]*linux[[:space:]]' "$new" || { rm -f "$new"; die 'the new grub.cfg has no kernel entry'; }
+  # A kernel entry: linux lines, or GRUB 2.14's `uki` command that lists the
+  # Unified Kernel Images at start, or a chainloaded EFI image.
+  grep -Eq '^[[:space:]]*(linux|uki|chainloader)([[:space:]]|$)' "$new" || { rm -f "$new"; die 'the new grub.cfg has no kernel entry'; }
   if [ "$want" = theme ]; then
     grep -q "set theme=.*nirux/theme.txt" "$new" || { rm -f "$new"; die 'the new grub.cfg does not load the theme'; }
   fi
@@ -416,6 +443,28 @@ write_dracut_conf() {
   mkdir -p "$(dirname "$DRACUT_CONF")"
   [ -e "$DRACUT_CONF" ] || undo_push "rm -f '$DRACUT_CONF'"
   printf '%s\n' "$want" > "$DRACUT_CONF"
+}
+
+# A Unified Kernel Image carries its own command line, from /etc/kernel/cmdline:
+# "quiet splash" go there when they are missing, and only those words come out
+# again on remove.
+write_uki_cmdline() {
+  [ -f "$UKI_CMDLINE" ] || return 1
+  local cur add='' t prev
+  prev=$(state_get uki_cmdline_added)
+  cur=" $(tr '\n' ' ' < "$UKI_CMDLINE") "
+  for t in quiet splash; do
+    case "$cur" in *" $t "*) ;; *) add="$add $t" ;; esac
+  done
+  if [ -z "$add" ]; then
+    [ -z "$prev" ] || state_extra+=("uki_cmdline_added=$prev")
+    return 1
+  fi
+  cp -a "$UKI_CMDLINE" "$BACKUP/kernel-cmdline.last"
+  undo_push "cp -a '$BACKUP/kernel-cmdline.last' '$UKI_CMDLINE'"
+  printf '%s\n' "$(printf '%s' "$cur" | sed 's/^ *//; s/ *$//')$add" > "$UKI_CMDLINE.nirusplash-new"
+  mv "$UKI_CMDLINE.nirusplash-new" "$UKI_CMDLINE"
+  state_extra+=("uki_cmdline_added=$(say $prev $add)")
 }
 
 ARCH_CONF=/etc/mkinitcpio.conf
@@ -563,18 +612,20 @@ install_cmd() {
       arch_hook
       kernel=$(newest_kernel)
       [ -n "$kernel" ] || die 'no kernel found in /boot'
+      if [ -n "$(uki_path "$kernel")" ] && write_uki_cmdline; then changed_ply=1; fi
       if [ -n "$changed_ply" ] || ! initramfs_has_theme "$kernel"; then
-        local img
-        img=$(initramfs_path "$kernel")
+        local img i=0
         info "making the initramfs for $kernel (the older kernels keep theirs)..."
-        if [ -f "$img" ]; then
+        for img in $(boot_images "$kernel"); do
+          [ -f "$img" ] || continue
+          i=$((i + 1))
           local need avail
           need=$(( $(stat -c %s "$img") / 1024 * 3 / 2 ))
           avail=$(df -Pk "$(dirname "$img")" | awk 'NR == 2 {print $4}')
           [ "${avail:-0}" -gt "$need" ] || die "too little room in $(dirname "$img") for a new initramfs"
-          cp -a "$img" "$BACKUP/initramfs.last"
-          undo_push "cp -a '$BACKUP/initramfs.last' '$img'"
-        fi
+          cp -a "$img" "$BACKUP/initramfs.last.$i"
+          undo_push "cp -a '$BACKUP/initramfs.last.$i' '$img'"
+        done
         rebuild_initramfs "$kernel" || die "the initramfs for $kernel could not be made"
         initramfs_has_theme "$kernel" || die "the new initramfs for $kernel has no NIRUX splash"
       fi
@@ -639,6 +690,10 @@ remove_cmd() {
     rm -rf "$PLY_DIR"
   fi
   rm -f "$VOID_QUIT" "$DRACUT_CONF"
+  local w
+  for w in $(state_get uki_cmdline_added); do
+    [ -f "$UKI_CMDLINE" ] && sed -i "s/[[:space:]]$w\([[:space:]]\|$\)/\1/" "$UKI_CMDLINE"
+  done
   if [ "$(state_get arch_hook)" = yes ] && [ -f "$ARCH_CONF" ]; then
     sed -i 's/^\(HOOKS=(.*\) plymouth\(.*\)$/\1\2/; s/^HOOKS=(plymouth /HOOKS=(/' "$ARCH_CONF"
   fi
@@ -704,7 +759,11 @@ doctor_cmd() {
     k=$(newest_kernel)
     initramfs_has_theme "$k" && ok "splash in the initramfs of $k" || no "the initramfs of $k has no NIRUX splash"
     grep -q '^Theme=nirux$' "$PLY_CONF" 2>/dev/null && ok 'Plymouth uses the NIRUX theme' || no "$PLY_CONF does not choose nirux"
-    grep -q 'splash' "$GRUB_DIR/grub.cfg" 2>/dev/null && ok 'kernel command line has splash' || no 'kernel command line has no splash'
+    if [ -n "$(uki_path "$k")" ]; then
+      grep -qw splash "$UKI_CMDLINE" 2>/dev/null && ok "kernel command line has splash ($UKI_CMDLINE, Unified Kernel Image)" || no "$UKI_CMDLINE has no splash"
+    else
+      grep -q 'splash' "$GRUB_DIR/grub.cfg" 2>/dev/null && ok 'kernel command line has splash' || no 'kernel command line has no splash'
+    fi
     if [ "$OS" = void ]; then [ -f "$VOID_QUIT" ] && ok 'splash stops before the login screen' || no "missing $VOID_QUIT"; fi
   else
     hm 'no splash (text boot)'

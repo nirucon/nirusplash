@@ -386,8 +386,9 @@ def plymouth_theme(out, glyphs, lay, pal, template):
         c.mask(0, 0, lay.hash.adv, lay.hash.height, cell, colour)
         c.png(out / f"{name}.png")
     scanline_picture(lay, bg).png(out / "scan.png")
-    text_png(t, TAGLINE, muted, out / "tagline.png")
-    solid_png(out / "cover.png", lay.tag_w + t.adv * 2, t.height, bg)
+    # The line, one picture per character: typed by showing them in turn.
+    for i, ch in enumerate(TAGLINE):
+        text_png(t, ch, muted, out / f"tag-{i:02d}.png")
     solid_png(out / "cursor.png", t.adv, t.height, accent)
     solid_png(out / "cursor-hot.png", t.adv, t.height, fg)
     solid_png(out / "hash-cursor.png", lay.hash.adv, lay.hash.height, fg)

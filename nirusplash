@@ -33,6 +33,7 @@ PLY_DIR=$PLY_THEMES/nirux
 PLY_CONF=${NIRUSPLASH_PLYMOUTH_CONF:-/etc/plymouth/plymouthd.conf}
 VOID_QUIT=/etc/runit/core-services/99-nirusplash.sh
 DRACUT_CONF=/etc/dracut.conf.d/90-nirusplash.conf
+GRUB_D_SCRIPT=${NIRUSPLASH_GRUB_D:-/etc/grub.d}/06_nirusplash
 MARK_BEGIN='# >>> nirusplash (managed block; "nirusplash remove" takes it out)'
 MARK_END='# <<< nirusplash'
 
@@ -62,7 +63,15 @@ unpack() {
   here=$(dirname "$self")
   if grep -q '^__PAYLOAD__$' "$self"; then
     LIB=$(mktemp -d "${TMPDIR:-/tmp}/nirusplash.XXXXXX")
-    sed '1,/^__PAYLOAD__$/d' "$self" | base64 -d | tar -xJ -C "$LIB" ||
+    sed '1,/^__PAYLOAD__$/d' "$self" | base64 -d > "$LIB/payload.tar.xz" &&
+      python3 -I -c '
+import sys, tarfile
+with tarfile.open(sys.argv[1]) as t:
+    if hasattr(tarfile, "data_filter"):
+        t.extractall(sys.argv[2], filter="data")
+    else:
+        t.extractall(sys.argv[2])
+' "$LIB/payload.tar.xz" "$LIB" ||
       die 'the program file is damaged (payload does not unpack)'
   elif [ -f "$here/lib/compose.py" ] && [ -f "$here/build/assets/glyphs.json" ]; then
     LIB=$(mktemp -d "${TMPDIR:-/tmp}/nirusplash.XXXXXX")
@@ -153,10 +162,16 @@ initramfs_list() {
   esac 2>/dev/null
 }
 
+# The whole listing is read first: `list | grep -q` would stop reading at the
+# first match, and under pipefail the lister's SIGPIPE reads as "not found".
 initramfs_has_theme() {
-  local img
+  local img list
   img=$(initramfs_path "$1")
-  [ -f "$img" ] && initramfs_list "$img" | grep -q 'plymouth/themes/nirux/nirux.script'
+  [ -f "$img" ] || return 1
+  list=$(initramfs_list "$img") || :
+  case "$list" in *plymouth/themes/nirux/nirux.script*) return 0 ;; esac
+  log "initramfs $img: $(printf '%s\n' "$list" | wc -l) entries, no nirux.script; plymouth entries: $(printf '%s\n' "$list" | grep -c plymouth || :)"
+  return 1
 }
 
 rebuild_initramfs() {
@@ -282,6 +297,24 @@ grub_block() {
   say 'GRUB_DISABLE_SUBMENU="y"'
   [ -z "$add" ] || say "GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT:+\$GRUB_CMDLINE_LINUX_DEFAULT }${add# }\""
   say "$MARK_END"
+}
+
+# GRUB's own text ("Booting ...", e, c) on the theme's background instead of
+# black: a line after the header that grub-mkconfig adds to grub.cfg.
+write_grub_d() {
+  local want new=$GRUB_D_SCRIPT.nirusplash-new
+  want=$(printf '#!/bin/sh\n# nirusplash: the background of GRUB'"'"'s text in the NIRUX theme.\n[ -f "%s/theme.txt" ] || exit 0\necho '"'"'background_color "#%s"'"'"'\n' "$THEME_DIR" "$BG")
+  [ -d "$(dirname "$GRUB_D_SCRIPT")" ] || return 1
+  [ "$(cat "$GRUB_D_SCRIPT" 2>/dev/null)" != "$want" ] || return 1
+  printf '%s\n' "$want" > "$new"
+  chmod 755 "$new"
+  if [ -e "$GRUB_D_SCRIPT" ]; then
+    cp -a "$GRUB_D_SCRIPT" "$BACKUP/grub-d.last"
+    undo_push "cp -a '$BACKUP/grub-d.last' '$GRUB_D_SCRIPT'"
+  else
+    undo_push "rm -f '$GRUB_D_SCRIPT'"
+  fi
+  mv "$new" "$GRUB_D_SCRIPT"
 }
 
 write_grub_default() {
@@ -521,6 +554,7 @@ install_cmd() {
   # 3. GRUB's settings and grub.cfg.
   keep_original "$GRUB_DEFAULT_FILE"
   if write_grub_default "$(grub_block "$SIZE" "$splash_ok" "$font")"; then changed_grub=1; fi
+  if write_grub_d; then changed_grub=1; fi
   if [ -n "$changed_grub" ] || [ -n "$FORCE" ] || ! grep -q "set theme=.*nirux/theme.txt" "$GRUB_DIR/grub.cfg"; then
     info 'writing grub.cfg...'
     regen_grub_cfg theme
@@ -554,11 +588,21 @@ remove_cmd() {
   if [ -f "$GRUB_DEFAULT_FILE" ] && grep -qxF "$MARK_BEGIN" "$GRUB_DEFAULT_FILE"; then
     write_grub_default '' || :
   fi
+  # Out of the way before grub.cfg is made, back in place if that fails.
+  if [ -d "$THEME_DIR" ]; then
+    rm -rf "$THEME_DIR.nirusplash-old"
+    mv "$THEME_DIR" "$THEME_DIR.nirusplash-old"
+    undo_push "mv '$THEME_DIR.nirusplash-old' '$THEME_DIR'"
+  fi
+  if [ -e "$GRUB_D_SCRIPT" ]; then
+    mv "$GRUB_D_SCRIPT" "$BACKUP/grub-d.removed"
+    undo_push "mv '$BACKUP/grub-d.removed' '$GRUB_D_SCRIPT'"
+  fi
   if [ -n "$MKCONFIG" ]; then
     info 'writing grub.cfg...'
     regen_grub_cfg plain
   fi
-  rm -rf "$THEME_DIR"
+  rm -rf "$THEME_DIR.nirusplash-old"
   if [ -d "$PLY_DIR" ] || grep -q '^Theme=nirux$' "$PLY_CONF" 2>/dev/null; then
     had_ply=1
     restore_original "$PLY_CONF"
@@ -631,7 +675,7 @@ doctor_cmd() {
   else
     hm 'no splash (text boot)'
   fi
-  if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -q enabled; then
+  if command -v mokutil >/dev/null 2>&1 && case "$(mokutil --sb-state 2>/dev/null)" in *enabled*) true ;; *) false ;; esac; then
     hm 'Secure Boot is on: the signed GRUB must include gfxmenu and png (Debian and Ubuntu do)'
   fi
   return "$bad"

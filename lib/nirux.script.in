@@ -24,8 +24,10 @@ global.img.hash = Image("hash.png");
 global.img.hot = Image("hash-hot.png");
 global.img.hcur = Image("hash-cursor.png");
 global.img.scan = Image("scan.png");
-global.img.tag = Image("tagline.png");
-global.img.cover = Image("cover.png");
+for (i = 0; i < @TAG_LEN@; i++) {
+  if (i < 10) global.img.tagc[i] = Image("tag-0" + i + ".png");
+  else global.img.tagc[i] = Image("tag-" + i + ".png");
+}
 global.img.cur = Image("cursor.png");
 global.img.curhot = Image("cursor-hot.png");
 global.img.prompt = Image("prompt.png");
@@ -35,6 +37,7 @@ global.img.fail = Image("fail.png");
 
 global.t = 0;
 global.typed = 0;
+global.shown_line = 0;
 global.sw = 0;
 global.sh = 0;
 global.ask = 0;
@@ -51,10 +54,11 @@ global.s.hcur.SetZ(15);
 global.s.scan = Sprite();
 global.s.scan.SetZ(20);
 global.s.scan.SetOpacity(@SCAN@);
-global.s.tag = Sprite();
-global.s.tag.SetZ(25);
-global.s.cover = Sprite();
-global.s.cover.SetZ(30);
+for (i = 0; i < @TAG_LEN@; i++) {
+  global.ts[i] = Sprite();
+  global.ts[i].SetZ(25);
+  global.ts[i].SetOpacity(0);
+}
 global.s.cur = Sprite();
 global.s.cur.SetZ(40);
 global.s.cur.SetOpacity(0);
@@ -124,11 +128,11 @@ fun layout() {
   global.tag_adv = px(@TAG_ADV@);
   global.tag_left = Math.Int(centre - px(@TAG_W@) / 2);
   global.tag_y = global.top + px(@BANNER_H@) + px(@GAP@);
-  global.s.tag.SetImage(scaled(global.img.tag));
-  global.s.tag.SetX(global.tag_left);
-  global.s.tag.SetY(global.tag_y);
-  global.s.cover.SetImage(scaled(global.img.cover));
-  global.s.cover.SetY(global.tag_y);
+  for (i = 0; i < @TAG_LEN@; i++) {
+    global.ts[i].SetImage(scaled(global.img.tagc[i]));
+    global.ts[i].SetX(global.tag_left + i * global.tag_adv);
+    global.ts[i].SetY(global.tag_y);
+  }
   global.p_y = global.tag_y + px(@TAG_H@) + px(@U@ * 5 / 2);
   global.p_left = Math.Int(centre - (px(@PROMPT_W@) + 12 * global.tag_adv) / 2);
   global.s.prompt.SetImage(scaled(global.img.prompt));
@@ -196,7 +200,8 @@ fun refresh() {
   line = 0;
   if (global.t >= start) line = Math.Int((global.t - start) / global.type_line) + 1;
   if (line > @TAG_LEN@) line = @TAG_LEN@;
-  global.s.cover.SetX(global.tag_left + line * global.tag_adv);
+  for (i = global.shown_line; i < line; i++) global.ts[i].SetOpacity(1);
+  if (line > global.shown_line) global.shown_line = line;
   done = global.t >= start + @TAG_LEN@ * global.type_line;
   if (global.typed < global.n) {
     global.s.cur.SetOpacity(0);

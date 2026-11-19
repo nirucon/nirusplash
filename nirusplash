@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+# nirusplash: the NIRUX look for GRUB and the boot splash (Plymouth).
+#
+#   nirusplash install [OPTIONS]   make or refresh the boot look
+#   nirusplash remove              put the plain boot back
+#   nirusplash status [--json]     what is installed
+#   nirusplash doctor              check that every part is in place
+#   nirusplash --version
+#
+# Safety rules, kept by every command:
+#   - the EFI partition, the boot loader binary, crypttab, LUKS and the
+#     kernel are never touched; only GRUB's settings and theme, Plymouth's
+#     theme and the initramfs of the newest kernel;
+#   - every file is made next to its place, checked, and only then moved in;
+#     on any error everything already changed is put back;
+#   - the originals are kept in /var/lib/nirusplash/backup;
+#   - older kernels keep the initramfs they had, so the boot menu always has
+#     an entry made before nirusplash.
+set -Eeuo pipefail
+umask 022
+VERSION=0.1.0
+PROG=nirusplash
+STATE_DIR=${NIRUSPLASH_STATE_DIR:-/var/lib/nirusplash}
+BACKUP=$STATE_DIR/backup
+STATE=$STATE_DIR/state
+DISABLED=$STATE_DIR/disabled
+LOG=${NIRUSPLASH_LOG:-/var/log/nirusplash.log}
+GRUB_DEFAULT_FILE=${NIRUSPLASH_GRUB_DEFAULT:-/etc/default/grub}
+GRUB_DIR=${NIRUSPLASH_GRUB_DIR:-/boot/grub}
+THEME_DIR=$GRUB_DIR/themes/nirux
+PLY_THEMES=${NIRUSPLASH_PLYMOUTH_THEMES:-/usr/share/plymouth/themes}
+PLY_DIR=$PLY_THEMES/nirux
+PLY_CONF=${NIRUSPLASH_PLYMOUTH_CONF:-/etc/plymouth/plymouthd.conf}
+VOID_QUIT=/etc/runit/core-services/99-nirusplash.sh
+DRACUT_CONF=/etc/dracut.conf.d/90-nirusplash.conf
+MARK_BEGIN='# >>> nirusplash (managed block; "nirusplash remove" takes it out)'
+MARK_END='# <<< nirusplash'
+
+say() { printf '%s\n' "$*"; }
+log() { { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; } 2>/dev/null || :; }
+info() { say "$PROG: $*"; log "$*"; }
+warn() { say "$PROG: warning: $*" >&2; log "warning: $*"; }
+IN_TX=
+die() {
+  say "$PROG: $*" >&2
+  log "error: $*"
+  if [ -n "$IN_TX" ]; then IN_TX=; trap - ERR; undo_run; say "$PROG: the boot was left as it was. Log: $LOG" >&2; fi
+  exit 1
+}
+
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# ── the files that come with the program ─────────────────────────────────────
+# A release is one file: this script with a tar.xz of the composer, the glyph
+# tables and the GRUB fonts appended after the __PAYLOAD__ line. Run from the
+# source tree, it uses build/ there.
+LIB=
+unpack() {
+  [ -z "$LIB" ] || return 0
+  local self here
+  self=$(readlink -f "$0")
+  here=$(dirname "$self")
+  if grep -q '^__PAYLOAD__$' "$self"; then
+    LIB=$(mktemp -d "${TMPDIR:-/tmp}/nirusplash.XXXXXX")
+    sed '1,/^__PAYLOAD__$/d' "$self" | base64 -d | tar -xJ -C "$LIB" ||
+      die 'the program file is damaged (payload does not unpack)'
+  elif [ -f "$here/lib/compose.py" ] && [ -f "$here/build/assets/glyphs.json" ]; then
+    LIB=$(mktemp -d "${TMPDIR:-/tmp}/nirusplash.XXXXXX")
+    mkdir -p "$LIB/lib"
+    cp "$here/lib/compose.py" "$here/lib/nirux.script.in" "$LIB/lib/"
+    cp "$here/VERSION" "$LIB/lib/VERSION"
+    cp -r "$here/build/assets" "$LIB/assets"
+    cp -r "$here/build/grub-fonts" "$LIB/grub-fonts"
+  else
+    die 'no payload and no source tree with build/ next to the program'
+  fi
+}
+
+WORK=
+cleanup() {
+  [ -z "$LIB" ] || rm -rf "$LIB"
+  [ -z "$WORK" ] || rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# ── the machine ──────────────────────────────────────────────────────────────
+OS=
+detect_os() {
+  local id like
+  id=$(. /etc/os-release 2>/dev/null && say "${ID:-}")
+  like=$(. /etc/os-release 2>/dev/null && say "${ID_LIKE:-}")
+  case "$id $like" in
+    void*) OS=void ;;
+    arch*|*" arch"*) OS=arch ;;
+    debian*|ubuntu*|*debian*) OS=debian ;;
+    *) OS=other ;;
+  esac
+}
+
+MKCONFIG=
+detect_grub() {
+  MKCONFIG=$(command -v grub-mkconfig || command -v grub2-mkconfig ||
+    { [ -x /usr/sbin/grub-mkconfig ] && say /usr/sbin/grub-mkconfig; } || :)
+  [ -n "$MKCONFIG" ] && [ -f "$GRUB_DIR/grub.cfg" ] && [ -f "$GRUB_DEFAULT_FILE" ]
+}
+
+# The screen GRUB and the splash are made for: the built-in panel, or else
+# the first connected monitor, at its preferred mode.
+detect_size() {
+  local best='' s m first
+  for s in /sys/class/drm/card*-*/status; do
+    [ -f "$s" ] || continue
+    [ "$(cat "$s" 2>/dev/null)" = connected ] || continue
+    m=$(head -1 "$(dirname "$s")/modes" 2>/dev/null || :)
+    case "$m" in [0-9]*x[0-9]*) ;; *) continue ;; esac
+    first=${first:-$m}
+    case "$s" in *-eDP-*|*-LVDS-*|*-DSI-*) best=$m; break ;; esac
+  done
+  m=${best:-${first:-}}
+  m=${m%%[!0-9x]*}
+  say "${m:-1920x1080}"
+}
+
+newest_kernel() {
+  local v
+  case "$OS" in
+    debian)
+      v=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V | tail -1) ;;
+    void)
+      v=$(ls /boot/vmlinuz-* 2>/dev/null | sed 's|^/boot/vmlinuz-||' | sort -V | tail -1) ;;
+    arch)
+      v=$(ls /usr/lib/modules 2>/dev/null | sort -V | tail -1) ;;
+  esac
+  say "${v:-}"
+}
+
+initramfs_path() {
+  case "$OS" in
+    debian) say "/boot/initrd.img-$1" ;;
+    void) say "/boot/initramfs-$1.img" ;;
+    arch)
+      local base
+      base=$(cat "/usr/lib/modules/$1/pkgbase" 2>/dev/null || say linux)
+      say "/boot/initramfs-$base.img" ;;
+  esac
+}
+
+initramfs_list() {
+  case "$OS" in
+    debian) lsinitramfs "$1" ;;
+    void) lsinitrd "$1" ;;
+    arch) lsinitcpio "$1" ;;
+  esac 2>/dev/null
+}
+
+initramfs_has_theme() {
+  local img
+  img=$(initramfs_path "$1")
+  [ -f "$img" ] && initramfs_list "$img" | grep -q 'plymouth/themes/nirux/nirux.script'
+}
+
+rebuild_initramfs() {
+  local v=$1
+  case "$OS" in
+    debian) update-initramfs -u -k "$v" ;;
+    void) dracut --force "$(initramfs_path "$v")" "$v" ;;
+    arch) mkinitcpio -P ;;
+  esac >> "$LOG" 2>&1
+}
+
+pkg_install() {
+  case "$OS" in
+    debian) DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$@" ;;
+    void) xbps-install -Sy "$@" ;;
+    arch) pacman -S --noconfirm --needed "$@" ;;
+  esac >> "$LOG" 2>&1
+}
+
+pkg_remove() {
+  case "$OS" in
+    debian) DEBIAN_FRONTEND=noninteractive apt-get purge -y -q "$@" ;;
+    void) xbps-remove -y "$@" ;;
+    arch) pacman -Rns --noconfirm "$@" ;;
+  esac >> "$LOG" 2>&1
+}
+
+# ── state ────────────────────────────────────────────────────────────────────
+state_get() { [ -f "$STATE" ] && sed -n "s/^$1=//p" "$STATE" | tail -1 || :; }
+state_write() {
+  mkdir -p "$STATE_DIR"
+  { for kv in "$@"; do say "$kv"; done; } > "$STATE.new"
+  mv "$STATE.new" "$STATE"
+}
+
+# Keep the first original of a file: later runs never overwrite it.
+keep_original() {
+  local f=$1 name
+  name=$(say "$f" | tr / _)
+  mkdir -p "$BACKUP"
+  if [ -e "$f" ]; then
+    [ -e "$BACKUP/$name.orig" ] || cp -a "$f" "$BACKUP/$name.orig"
+  else
+    [ -e "$BACKUP/$name.absent" ] || : > "$BACKUP/$name.absent"
+  fi
+}
+
+restore_original() {
+  local f=$1 name
+  name=$(say "$f" | tr / _)
+  if [ -e "$BACKUP/$name.orig" ]; then
+    cp -a "$BACKUP/$name.orig" "$f.nirusplash-new" && mv "$f.nirusplash-new" "$f"
+    rm -f "$BACKUP/$name.orig"
+  elif [ -e "$BACKUP/$name.absent" ]; then
+    rm -f "$f" "$BACKUP/$name.absent"
+  fi
+}
+
+# ── undo while installing ────────────────────────────────────────────────────
+# Each step that changes the system pushes a command that puts it back; on an
+# error they run newest first.
+UNDO=()
+undo_push() { UNDO+=("$1"); }
+undo_run() {
+  local i
+  [ "${#UNDO[@]}" -gt 0 ] || return 0
+  warn 'putting back what was changed'
+  for ((i = ${#UNDO[@]} - 1; i >= 0; i--)); do
+    eval "${UNDO[$i]}" >> "$LOG" 2>&1 || warn "could not undo: ${UNDO[$i]}"
+  done
+  UNDO=()
+}
+on_error() {
+  local rc=$?
+  die "failed (exit $rc, line ${1:-?})"
+}
+
+# Move a ready directory into place, keeping the old one until the end.
+swap_dir() {
+  local new=$1 dest=$2
+  rm -rf "$dest.nirusplash-old"
+  if [ -e "$dest" ]; then
+    mv "$dest" "$dest.nirusplash-old"
+    undo_push "rm -rf '$dest'; mv '$dest.nirusplash-old' '$dest'"
+  else
+    undo_push "rm -rf '$dest'"
+  fi
+  mv "$new" "$dest"
+}
+
+# ── GRUB settings ────────────────────────────────────────────────────────────
+strip_block() {
+  awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+    $0 == b {skip = 1; next}
+    $0 == e {skip = 0; next}
+    !skip {print}' "$1"
+}
+
+# The value GRUB_CMDLINE_LINUX_DEFAULT has without our block.
+cmdline_without_block() {
+  local f
+  f=$(mktemp)
+  strip_block "$GRUB_DEFAULT_FILE" > "$f"
+  # shellcheck disable=SC1090
+  ( set +u; . "$f" >/dev/null 2>&1; printf '%s' "${GRUB_CMDLINE_LINUX_DEFAULT:-}" )
+  rm -f "$f"
+}
+
+grub_block() {
+  local size=$1 splash=$2 font=$3 add='' base t
+  base=" $(cmdline_without_block) "
+  for t in quiet ${splash:+splash}; do
+    case "$base" in *" $t "*) ;; *) add="$add $t" ;; esac
+  done
+  say "$MARK_BEGIN"
+  say "GRUB_THEME=\"$THEME_DIR/theme.txt\""
+  say "GRUB_FONT=\"$THEME_DIR/$font\""
+  say "GRUB_GFXMODE=\"$size,auto\""
+  say 'GRUB_TERMINAL_OUTPUT="gfxterm"'
+  say 'GRUB_TIMEOUT_STYLE="menu"'
+  say "GRUB_TIMEOUT=\"$TIMEOUT\""
+  say '# Every installed kernel straight in the menu, newest first.'
+  say 'GRUB_DISABLE_SUBMENU="y"'
+  [ -z "$add" ] || say "GRUB_CMDLINE_LINUX_DEFAULT=\"\${GRUB_CMDLINE_LINUX_DEFAULT:+\$GRUB_CMDLINE_LINUX_DEFAULT }${add# }\""
+  say "$MARK_END"
+}
+
+write_grub_default() {
+  local block=$1 new=$GRUB_DEFAULT_FILE.nirusplash-new
+  { strip_block "$GRUB_DEFAULT_FILE"; [ -z "$block" ] || say "$block"; } > "$new"
+  chmod --reference="$GRUB_DEFAULT_FILE" "$new" 2>/dev/null || chmod 644 "$new"
+  # shellcheck disable=SC1090
+  ( set +u; . "$new" ) >/dev/null 2>&1 || { rm -f "$new"; die "the new $GRUB_DEFAULT_FILE does not parse"; }
+  if cmp -s "$new" "$GRUB_DEFAULT_FILE"; then rm -f "$new"; return 1; fi
+  cp -a "$GRUB_DEFAULT_FILE" "$BACKUP/grub-default.last"
+  undo_push "cp -a '$BACKUP/grub-default.last' '$GRUB_DEFAULT_FILE'"
+  mv "$new" "$GRUB_DEFAULT_FILE"
+}
+
+# grub.cfg: made next to the old one, checked with grub-script-check, then
+# moved in.
+regen_grub_cfg() {
+  local cfg=$GRUB_DIR/grub.cfg new=$GRUB_DIR/grub.cfg.nirusplash-new want=$1
+  "$MKCONFIG" -o "$new" >> "$LOG" 2>&1 || { rm -f "$new"; die 'grub-mkconfig failed (see the log)'; }
+  if command -v grub-script-check >/dev/null 2>&1; then
+    grub-script-check "$new" >> "$LOG" 2>&1 || { rm -f "$new"; die 'the new grub.cfg did not pass grub-script-check'; }
+  fi
+  grep -q '^[[:space:]]*linux[[:space:]]' "$new" || { rm -f "$new"; die 'the new grub.cfg has no kernel entry'; }
+  if [ "$want" = theme ]; then
+    grep -q "set theme=.*nirux/theme.txt" "$new" || { rm -f "$new"; die 'the new grub.cfg does not load the theme'; }
+  fi
+  cp -a "$cfg" "$BACKUP/grub.cfg.last"
+  undo_push "cp -a '$BACKUP/grub.cfg.last' '$cfg'"
+  mv "$new" "$cfg"
+}
+
+# ── Plymouth ─────────────────────────────────────────────────────────────────
+write_plymouth_conf() {
+  keep_original "$PLY_CONF"
+  mkdir -p "$(dirname "$PLY_CONF")"
+  if [ -f "$PLY_CONF" ]; then
+    cp -a "$PLY_CONF" "$BACKUP/plymouthd.conf.last"
+    undo_push "cp -a '$BACKUP/plymouthd.conf.last' '$PLY_CONF'"
+  else
+    undo_push "rm -f '$PLY_CONF'"
+  fi
+  { say '# Written by nirusplash; "nirusplash remove" puts the original back.'
+    say '[Daemon]'
+    say 'Theme=nirux'
+    say 'ShowDelay=0'
+    say 'DeviceTimeout=8'
+  } > "$PLY_CONF.nirusplash-new"
+  mv "$PLY_CONF.nirusplash-new" "$PLY_CONF"
+}
+
+# Void runs no plymouth-quit service: stop the splash at the end of stage 1,
+# before greetd starts X on its own terminal.
+write_void_quit() {
+  [ "$OS" = void ] || return 0
+  [ -d /etc/runit/core-services ] || return 0
+  { say '# nirusplash: stop the boot splash before the services start.'
+    say 'if command -v plymouth >/dev/null 2>&1 && plymouth --ping 2>/dev/null; then'
+    say '  plymouth quit'
+    say 'fi'
+  } > "$VOID_QUIT.nirusplash-new"
+  if cmp -s "$VOID_QUIT.nirusplash-new" "$VOID_QUIT"; then rm -f "$VOID_QUIT.nirusplash-new"; return 0; fi
+  [ -e "$VOID_QUIT" ] || undo_push "rm -f '$VOID_QUIT'"
+  mv "$VOID_QUIT.nirusplash-new" "$VOID_QUIT"
+}
+
+# dracut (Void): ask for the plymouth module, so a host-only initramfs never
+# leaves it out.
+write_dracut_conf() {
+  [ "$OS" = void ] || return 0
+  local want='add_dracutmodules+=" plymouth "'
+  [ "$(cat "$DRACUT_CONF" 2>/dev/null)" != "$want" ] || return 0
+  mkdir -p "$(dirname "$DRACUT_CONF")"
+  [ -e "$DRACUT_CONF" ] || undo_push "rm -f '$DRACUT_CONF'"
+  printf '%s\n' "$want" > "$DRACUT_CONF"
+}
+
+ARCH_CONF=/etc/mkinitcpio.conf
+arch_hook() {
+  [ "$OS" = arch ] || return 0
+  local hooks
+  hooks=$(sed -n 's/^HOOKS=(\(.*\))/\1/p' "$ARCH_CONF" | tail -1)
+  case " $hooks " in
+    *" plymouth "*) [ "$(state_get arch_hook)" != yes ] || state_extra+=("arch_hook=yes"); return 0 ;;
+  esac
+  keep_original "$ARCH_CONF"
+  cp -a "$ARCH_CONF" "$BACKUP/mkinitcpio.conf.last"
+  undo_push "cp -a '$BACKUP/mkinitcpio.conf.last' '$ARCH_CONF'"
+  # After udev (or systemd), before encrypt, so the password is asked in it.
+  local out='' h done=''
+  for h in $hooks; do
+    out="$out $h"
+    if [ -z "$done" ] && { [ "$h" = udev ] || [ "$h" = systemd ]; }; then out="$out plymouth"; done=1; fi
+  done
+  [ -n "$done" ] || out="plymouth$out"
+  sed "s/^HOOKS=(.*)/HOOKS=(${out# })/" "$ARCH_CONF" > "$ARCH_CONF.nirusplash-new"
+  mv "$ARCH_CONF.nirusplash-new" "$ARCH_CONF"
+  state_extra+=("arch_hook=yes")
+}
+
+# ── install ──────────────────────────────────────────────────────────────────
+BG=0f0f10 FG=e5e5e5 MUTED=a8a8a8 FOCUS=5a5a60 ERRC=d77a7a
+SIZE='' TIMEOUT=3 SPLASH=yes FORCE='' IF_ENABLED=''
+state_extra=()
+
+hex_ok() { case "$1" in [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) return 0 ;; esac; return 1; }
+
+parse_install() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --background|--foreground|--muted|--focus|--error)
+        [ $# -ge 2 ] || die "$1 needs a colour"
+        local v=${2#\#}
+        hex_ok "$v" || die "$1: not a colour (RRGGBB): $2"
+        case "$1" in
+          --background) BG=$v ;; --foreground) FG=$v ;; --muted) MUTED=$v ;;
+          --focus) FOCUS=$v ;; --error) ERRC=$v ;;
+        esac
+        shift 2 ;;
+      --size)
+        [ $# -ge 2 ] || die '--size needs WIDTHxHEIGHT'
+        case "$2" in [0-9]*x[0-9]*) SIZE=$2 ;; *) die "--size: $2" ;; esac
+        shift 2 ;;
+      --timeout)
+        [ $# -ge 2 ] || die '--timeout needs seconds'
+        case "$2" in ''|*[!0-9]*) die "--timeout: $2" ;; esac
+        [ "$2" -ge 1 ] && [ "$2" -le 30 ] || die '--timeout: 1 to 30 seconds'
+        TIMEOUT=$2; shift 2 ;;
+      --no-splash) SPLASH=; shift ;;
+      --force) FORCE=1; shift ;;
+      --if-enabled) IF_ENABLED=1; shift ;;
+      *) die "install: unknown option $1" ;;
+    esac
+  done
+}
+
+need_root() { [ "$(id -u)" = 0 ] || die "$1 needs root (sudo $PROG $1)"; }
+
+lock() {
+  mkdir -p "$STATE_DIR"
+  exec 9> "$STATE_DIR/lock"
+  command -v flock >/dev/null 2>&1 && { flock -n 9 || die 'another nirusplash is running'; }
+}
+
+fingerprint() { (cd "$1" && find . -type f -print0 | sort -z | xargs -0 sha256sum) | sha256sum | cut -c1-16; }
+
+install_cmd() {
+  parse_install "$@"
+  need_root install
+  if [ -n "$IF_ENABLED" ] && [ -f "$DISABLED" ]; then
+    say "$PROG: turned off (nirusplash install turns it on); nothing done"
+    return 0
+  fi
+  lock
+  mkdir -p "$STATE_DIR" "$BACKUP"
+  log "install $VERSION $*"
+  detect_os
+  [ "$OS" != other ] || die 'only Debian, Void and Arch are supported'
+  detect_grub || die 'this machine does not boot with GRUB (grub-mkconfig, /boot/grub/grub.cfg and /etc/default/grub are needed)'
+  if ! command -v python3 >/dev/null 2>&1; then
+    # A fresh base system (NIRUBOOT) may not have it yet; NIRUX needs it too.
+    info 'installing python3 (the pictures are made with it)...'
+    case "$OS" in arch) pkg_install python ;; *) pkg_install python3 ;; esac ||
+      die 'python3 is needed and could not be installed'
+  fi
+  [ -n "$SIZE" ] || SIZE=$(detect_size)
+  unpack
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/nirusplash-work.XXXXXX")
+  local w=${SIZE%x*} h=${SIZE#*x} font f
+  python3 -I "$LIB/lib/compose.py" --assets "$LIB/assets" --grub-fonts "$LIB/grub-fonts" \
+    --template "$LIB/lib/nirux.script.in" --out "$WORK/out" --width "$w" --height "$h" \
+    --background "$BG" --foreground "$FG" --muted "$MUTED" --focus "$FOCUS" --error "$ERRC" >> "$LOG" 2>&1 ||
+    die 'could not make the pictures'
+  font=''
+  for f in "$WORK"/out/grub/*.pf2; do [ -f "$f" ] && font=$(basename "$f") && break; done
+  [ -n "$font" ] || die 'no GRUB font was made'
+
+  IN_TX=1
+  trap 'on_error $LINENO' ERR
+  local changed_grub='' changed_ply='' kernel='' ply_installed_by_us
+  ply_installed_by_us=$(state_get plymouth_package_ours)
+
+  # 1. The GRUB theme.
+  if [ -n "$FORCE" ] || [ ! -d "$THEME_DIR" ] || [ "$(fingerprint "$WORK/out/grub")" != "$(fingerprint "$THEME_DIR")" ]; then
+    mkdir -p "$GRUB_DIR/themes"
+    rm -rf "$THEME_DIR.nirusplash-new"
+    cp -r "$WORK/out/grub" "$THEME_DIR.nirusplash-new"
+    swap_dir "$THEME_DIR.nirusplash-new" "$THEME_DIR"
+    changed_grub=1
+  fi
+
+  # 2. The splash, if it can be had.
+  local splash_ok=''
+  if [ -n "$SPLASH" ]; then
+    if ! command -v plymouthd >/dev/null 2>&1 && ! [ -x /usr/sbin/plymouthd ]; then
+      info 'installing Plymouth...'
+      if pkg_install plymouth; then
+        ply_installed_by_us=yes
+        undo_push "pkg_remove plymouth"
+      else
+        warn 'Plymouth could not be installed: GRUB gets the NIRUX look, the boot keeps its text'
+      fi
+    fi
+    if command -v plymouthd >/dev/null 2>&1 || [ -x /usr/sbin/plymouthd ]; then
+      splash_ok=1
+      if [ -n "$FORCE" ] || [ ! -d "$PLY_DIR" ] || [ "$(fingerprint "$WORK/out/plymouth")" != "$(fingerprint "$PLY_DIR")" ] ||
+         ! grep -q '^Theme=nirux$' "$PLY_CONF" 2>/dev/null; then
+        mkdir -p "$PLY_THEMES"
+        rm -rf "$PLY_DIR.nirusplash-new"
+        cp -r "$WORK/out/plymouth" "$PLY_DIR.nirusplash-new"
+        swap_dir "$PLY_DIR.nirusplash-new" "$PLY_DIR"
+        write_plymouth_conf
+        changed_ply=1
+      fi
+      write_void_quit
+      write_dracut_conf
+      arch_hook
+      kernel=$(newest_kernel)
+      [ -n "$kernel" ] || die 'no kernel found in /boot'
+      if [ -n "$changed_ply" ] || ! initramfs_has_theme "$kernel"; then
+        local img
+        img=$(initramfs_path "$kernel")
+        info "making the initramfs for $kernel (the older kernels keep theirs)..."
+        if [ -f "$img" ]; then
+          local need avail
+          need=$(( $(stat -c %s "$img") / 1024 * 3 / 2 ))
+          avail=$(df -Pk "$(dirname "$img")" | awk 'NR == 2 {print $4}')
+          [ "${avail:-0}" -gt "$need" ] || die "too little room in $(dirname "$img") for a new initramfs"
+          cp -a "$img" "$BACKUP/initramfs.last"
+          undo_push "cp -a '$BACKUP/initramfs.last' '$img'"
+        fi
+        rebuild_initramfs "$kernel" || die "the initramfs for $kernel could not be made"
+        initramfs_has_theme "$kernel" || die "the new initramfs for $kernel has no NIRUX splash"
+      fi
+    fi
+  fi
+
+  # 3. GRUB's settings and grub.cfg.
+  keep_original "$GRUB_DEFAULT_FILE"
+  if write_grub_default "$(grub_block "$SIZE" "$splash_ok" "$font")"; then changed_grub=1; fi
+  if [ -n "$changed_grub" ] || [ -n "$FORCE" ] || ! grep -q "set theme=.*nirux/theme.txt" "$GRUB_DIR/grub.cfg"; then
+    info 'writing grub.cfg...'
+    regen_grub_cfg theme
+  fi
+
+  trap - ERR
+  IN_TX=
+  rm -rf "$THEME_DIR.nirusplash-old" "$PLY_DIR.nirusplash-old"
+  rm -f "$DISABLED"
+  state_write "version=$VERSION" "size=$SIZE" "colours=$BG,$FG,$MUTED,$FOCUS,$ERRC" \
+    "timeout=$TIMEOUT" "splash=${splash_ok:+yes}" "plymouth_package_ours=${ply_installed_by_us:-}" \
+    "kernel=${kernel:-}" "os=$OS" "installed=$(date '+%F %T')" "${state_extra[@]}"
+  if [ -n "$changed_grub$changed_ply" ]; then
+    info "done: the NIRUX boot look ($SIZE${splash_ok:+, splash on $kernel}) is used from the next start"
+  else
+    info 'already up to date'
+  fi
+}
+
+# ── remove ───────────────────────────────────────────────────────────────────
+remove_cmd() {
+  need_root remove
+  lock
+  mkdir -p "$STATE_DIR" "$BACKUP"
+  log "remove $VERSION"
+  detect_os
+  detect_grub || warn 'GRUB was not found; only the splash is removed'
+  IN_TX=1
+  trap 'on_error $LINENO' ERR
+  local had_ply=''
+  if [ -f "$GRUB_DEFAULT_FILE" ] && grep -qxF "$MARK_BEGIN" "$GRUB_DEFAULT_FILE"; then
+    write_grub_default '' || :
+  fi
+  if [ -n "$MKCONFIG" ]; then
+    info 'writing grub.cfg...'
+    regen_grub_cfg plain
+  fi
+  rm -rf "$THEME_DIR"
+  if [ -d "$PLY_DIR" ] || grep -q '^Theme=nirux$' "$PLY_CONF" 2>/dev/null; then
+    had_ply=1
+    restore_original "$PLY_CONF"
+    rm -rf "$PLY_DIR"
+  fi
+  rm -f "$VOID_QUIT" "$DRACUT_CONF"
+  if [ "$(state_get arch_hook)" = yes ] && [ -f "$ARCH_CONF" ]; then
+    sed -i 's/^\(HOOKS=(.*\) plymouth\(.*\)$/\1\2/; s/^HOOKS=(plymouth /HOOKS=(/' "$ARCH_CONF"
+  fi
+  if [ "$(state_get plymouth_package_ours)" = yes ]; then
+    info 'removing the Plymouth package nirusplash installed...'
+    pkg_remove plymouth || warn 'Plymouth could not be removed'
+    had_ply=1
+  fi
+  if [ -n "$had_ply" ]; then
+    local kernel
+    kernel=$(newest_kernel)
+    if [ -n "$kernel" ]; then
+      info "making the initramfs for $kernel without the splash..."
+      rebuild_initramfs "$kernel" || warn "the initramfs for $kernel could not be made again; run it by hand"
+    fi
+  fi
+  trap - ERR
+  IN_TX=
+  : > "$DISABLED"
+  state_write "version=$VERSION" "removed=$(date '+%F %T')"
+  info 'done: the plain boot is back; "nirusplash install" brings the NIRUX look back'
+}
+
+# ── status and doctor ────────────────────────────────────────────────────────
+status_cmd() {
+  detect_os
+  local on=no
+  [ -f "$THEME_DIR/theme.txt" ] && grep -qxF "$MARK_BEGIN" "$GRUB_DEFAULT_FILE" 2>/dev/null && on=yes
+  [ ! -f "$DISABLED" ] || on=off
+  if [ "${1:-}" = --json ]; then
+    printf '{"version":"%s","installed":"%s","state_version":"%s","size":"%s","splash":"%s","kernel":"%s"}\n' \
+      "$VERSION" "$on" "$(state_get version)" "$(state_get size)" "$(state_get splash)" "$(state_get kernel)"
+    return 0
+  fi
+  say "NIRUX boot look: $on"
+  say "  program:    $VERSION (installed by $(state_get version || :))"
+  say "  screen:     $(state_get size)"
+  say "  splash:     $( [ "$(state_get splash)" = yes ] && say "Plymouth, made into the initramfs of $(state_get kernel)" || say 'no (text boot)')"
+  say "  timeout:    $(state_get timeout) s"
+  say "  log:        $LOG"
+}
+
+doctor_cmd() {
+  detect_os
+  local bad=0 k
+  ok() { say "  ok    $*"; }
+  no() { say "  FAIL  $*"; bad=1; }
+  hm() { say "  warn  $*"; }
+  say "nirusplash $VERSION doctor"
+  if detect_grub; then ok "GRUB found ($MKCONFIG)"; else no 'GRUB not found'; fi
+  [ -f "$THEME_DIR/theme.txt" ] && ok 'GRUB theme in place' || no "no $THEME_DIR/theme.txt"
+  grep -qxF "$MARK_BEGIN" "$GRUB_DEFAULT_FILE" 2>/dev/null && ok "settings block in $GRUB_DEFAULT_FILE" || no "no settings block in $GRUB_DEFAULT_FILE"
+  grep -q "set theme=.*nirux/theme.txt" "$GRUB_DIR/grub.cfg" 2>/dev/null && ok 'grub.cfg loads the theme' || no 'grub.cfg does not load the theme (run nirusplash install)'
+  if ls /etc/default/grub.d/*.cfg >/dev/null 2>&1 && grep -lE '^GRUB_(THEME|TERMINAL|TIMEOUT|GFXMODE)' /etc/default/grub.d/*.cfg >/dev/null 2>&1; then
+    hm '/etc/default/grub.d overrides some GRUB settings'
+  fi
+  if grep -qE '^GRUB_TERMINAL=.*console' "$GRUB_DEFAULT_FILE" 2>/dev/null; then hm 'GRUB_TERMINAL=console turns the graphical menu off'; fi
+  if [ "$(state_get splash)" = yes ]; then
+    k=$(newest_kernel)
+    initramfs_has_theme "$k" && ok "splash in the initramfs of $k" || no "the initramfs of $k has no NIRUX splash"
+    grep -q '^Theme=nirux$' "$PLY_CONF" 2>/dev/null && ok 'Plymouth uses the NIRUX theme' || no "$PLY_CONF does not choose nirux"
+    grep -q 'splash' "$GRUB_DIR/grub.cfg" 2>/dev/null && ok 'kernel command line has splash' || no 'kernel command line has no splash'
+    if [ "$OS" = void ]; then [ -f "$VOID_QUIT" ] && ok 'splash stops before the login screen' || no "missing $VOID_QUIT"; fi
+  else
+    hm 'no splash (text boot)'
+  fi
+  if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -q enabled; then
+    hm 'Secure Boot is on: the signed GRUB must include gfxmenu and png (Debian and Ubuntu do)'
+  fi
+  return "$bad"
+}
+
+case "${1:-}" in
+  --version|version) say "nirusplash $VERSION" ;;
+  install) shift; install_cmd "$@" ;;
+  remove) shift; remove_cmd "$@" ;;
+  status) shift; status_cmd "$@" ;;
+  doctor) shift; doctor_cmd "$@" ;;
+  ''|-h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
+exit 0

@@ -183,6 +183,24 @@ rebuild_initramfs() {
   esac >> "$LOG" 2>&1
 }
 
+pkg_has() {
+  case "$OS" in
+    debian) dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null | grep -qx 'install ok installed' ;;
+    void) xbps-query "$1" >/dev/null 2>&1 ;;
+    arch) pacman -Q "$1" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# What the splash needs. Debian's initramfs hook for script themes also wants
+# the label plugin and fontconfig (plymouth-label brings both).
+splash_packages() {
+  case "$OS" in
+    debian) say 'plymouth plymouth-label' ;;
+    *) say plymouth ;;
+  esac
+}
+
 pkg_install() {
   case "$OS" in
     debian) DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$@" ;;
@@ -493,8 +511,9 @@ install_cmd() {
 
   IN_TX=1
   trap 'on_error $LINENO' ERR
-  local changed_grub='' changed_ply='' kernel='' ply_installed_by_us
-  ply_installed_by_us=$(state_get plymouth_package_ours)
+  local changed_grub='' changed_ply='' kernel='' pkgs_ours missing='' p
+  pkgs_ours=$(state_get splash_packages_ours)
+  [ "$(state_get plymouth_package_ours)" != yes ] || pkgs_ours="plymouth $pkgs_ours"
 
   # 1. The GRUB theme.
   if [ -n "$FORCE" ] || [ ! -d "$THEME_DIR" ] || [ "$(fingerprint "$WORK/out/grub")" != "$(fingerprint "$THEME_DIR")" ]; then
@@ -508,11 +527,13 @@ install_cmd() {
   # 2. The splash, if it can be had.
   local splash_ok=''
   if [ -n "$SPLASH" ]; then
-    if ! command -v plymouthd >/dev/null 2>&1 && ! [ -x /usr/sbin/plymouthd ]; then
-      info 'installing Plymouth...'
-      if pkg_install plymouth; then
-        ply_installed_by_us=yes
-        undo_push "pkg_remove plymouth"
+    for p in $(splash_packages); do pkg_has "$p" || missing="$missing $p"; done
+    if [ -n "$missing" ]; then
+      info "installing${missing}..."
+      # shellcheck disable=SC2086
+      if pkg_install $missing; then
+        pkgs_ours="$pkgs_ours$missing"
+        undo_push "pkg_remove$missing"
       else
         warn 'Plymouth could not be installed: GRUB gets the NIRUX look, the boot keeps its text'
       fi
@@ -565,7 +586,7 @@ install_cmd() {
   rm -rf "$THEME_DIR.nirusplash-old" "$PLY_DIR.nirusplash-old"
   rm -f "$DISABLED"
   state_write "version=$VERSION" "size=$SIZE" "colours=$BG,$FG,$MUTED,$FOCUS,$ERRC" \
-    "timeout=$TIMEOUT" "splash=${splash_ok:+yes}" "plymouth_package_ours=${ply_installed_by_us:-}" \
+    "timeout=$TIMEOUT" "splash=${splash_ok:+yes}" "splash_packages_ours=$(say $pkgs_ours)" \
     "kernel=${kernel:-}" "os=$OS" "installed=$(date '+%F %T')" "${state_extra[@]}"
   if [ -n "$changed_grub$changed_ply" ]; then
     info "done: the NIRUX boot look ($SIZE${splash_ok:+, splash on $kernel}) is used from the next start"
@@ -612,9 +633,13 @@ remove_cmd() {
   if [ "$(state_get arch_hook)" = yes ] && [ -f "$ARCH_CONF" ]; then
     sed -i 's/^\(HOOKS=(.*\) plymouth\(.*\)$/\1\2/; s/^HOOKS=(plymouth /HOOKS=(/' "$ARCH_CONF"
   fi
-  if [ "$(state_get plymouth_package_ours)" = yes ]; then
-    info 'removing the Plymouth package nirusplash installed...'
-    pkg_remove plymouth || warn 'Plymouth could not be removed'
+  local ours
+  ours=$(state_get splash_packages_ours)
+  [ "$(state_get plymouth_package_ours)" != yes ] || ours="plymouth $ours"
+  if [ -n "$ours" ]; then
+    info "removing what nirusplash installed: $ours..."
+    # shellcheck disable=SC2086
+    pkg_remove $ours || warn 'the packages could not be removed'
     had_ply=1
   fi
   if [ -n "$had_ply" ]; then

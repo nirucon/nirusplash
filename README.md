@@ -11,6 +11,11 @@ NIRUX lock and login screens.
   blinking cursor, as on the lock screen. The disk password is asked at
   `$ unlock disk`, with `[ .. ] unlocking` and `[ fail ] wrong password, try
   again`. Esc shows the start-up messages.
+- **Shutting down and restarting:** the banner and the line at once, then
+  `[ ok ] session closed` and `[ .. ] powering off` (or `restarting`) with the
+  cursor blinking after it. systemd starts it with Plymouth's own
+  plymouth-poweroff and plymouth-reboot units; on Void a file in
+  `/etc/runit/shutdown.d` does it once the services have stopped.
 
 The pictures are made on the machine for its own screen and the colours of the
 NIRUX theme, with nothing but `python3`.
@@ -45,7 +50,8 @@ Changed:
 - The initramfs of the **newest** kernel. Older kernels keep the one they
   had, so the menu always has an entry made without the splash.
 - Void: `/etc/runit/core-services/99-nirusplash.sh` stops the splash before
-  the login screen starts, and `/etc/dracut.conf.d/90-nirusplash.conf` asks
+  the login screen starts, `/etc/runit/shutdown.d/15-nirusplash.sh` shows it
+  again while the machine stops, and `/etc/dracut.conf.d/90-nirusplash.conf` asks
   dracut for the Plymouth module. Arch: `plymouth` in the mkinitcpio hooks,
   before `encrypt`.
 

@@ -4,7 +4,8 @@
 # accent), then A MINIMAL X11 DESKTOP, then the block cursor blinks: the
 # same as nirulock's ascii layout. A disk password is asked at a prompt in
 # the same style. Everything is drawn from pictures made for this screen;
-# a screen of another size scales them.
+# a screen of another size scales them. Shutting down or restarting shows
+# the banner at once and two status lines, the cursor blinking after them.
 
 Window.SetBackgroundTopColor(@BG_R@, @BG_G@, @BG_B@);
 Window.SetBackgroundBottomColor(@BG_R@, @BG_G@, @BG_B@);
@@ -34,6 +35,9 @@ global.img.prompt = Image("prompt.png");
 global.img.bullet = Image("bullet.png");
 global.img.working = Image("working.png");
 global.img.fail = Image("fail.png");
+global.img.bclosed = Image("bye-closed.png");
+global.img.boff = Image("bye-off.png");
+global.img.breboot = Image("bye-reboot.png");
 
 global.t = 0;
 global.typed = 0;
@@ -43,6 +47,9 @@ global.sh = 0;
 global.ask = 0;
 global.bullets = 0;
 global.status = "";
+# Shutting down: 0 not yet, else the time it began; the mode it shows.
+global.bye = 0;
+global.bye_mode = "";
 
 for (i = 0; i < global.n; i++) {
   global.hs[i] = Sprite();
@@ -71,6 +78,12 @@ global.s.pcur.SetOpacity(0);
 global.s.status = Sprite();
 global.s.status.SetZ(40);
 global.s.status.SetOpacity(0);
+global.s.b1 = Sprite();
+global.s.b1.SetZ(40);
+global.s.b1.SetOpacity(0);
+global.s.b2 = Sprite();
+global.s.b2.SetZ(40);
+global.s.b2.SetOpacity(0);
 for (i = 0; i < 32; i++) {
   global.bs[i] = Sprite();
   global.bs[i].SetZ(40);
@@ -146,7 +159,23 @@ fun layout() {
   global.s.pcur.SetImage(global.si.cur);
   global.s.pcur.SetY(global.p_y);
   global.s.status.SetX(global.p_left);
+  global.b_left = Math.Int(centre - px(@BYE_W@) / 2);
+  global.s.b1.SetImage(scaled(global.img.bclosed));
+  global.s.b1.SetX(global.b_left);
+  global.s.b1.SetY(global.p_y);
+  global.s.b2.SetX(global.b_left);
+  global.s.b2.SetY(global.p_y + px(@U@) * 3 / 2);
+  show_bye();
   show_status();
+}
+
+fun is_bye(mode) {
+  return mode == "shutdown" || mode == "reboot";
+}
+
+fun show_bye() {
+  if (global.bye_mode == "reboot") global.s.b2.SetImage(scaled(global.img.breboot));
+  else global.s.b2.SetImage(scaled(global.img.boff));
 }
 
 fun show_status() {
@@ -171,6 +200,21 @@ fun blink_on() {
 fun refresh() {
   global.t += global.frame_ms;
   if (Window.GetWidth() != global.sw || Window.GetHeight() != global.sh) layout();
+
+  # Shutting down or restarting (the mode can change on the way: Void asks
+  # for a restart after the daemon has started).
+  mode = Plymouth.GetMode();
+  if (is_bye(mode)) {
+    if (global.bye == 0) {
+      # The banner and the line at once: there is no time to type them.
+      global.t = global.n * global.type_banner + global.breath + @TAG_LEN@ * global.type_line;
+      global.bye = global.t;
+    }
+    if (mode != global.bye_mode) {
+      global.bye_mode = mode;
+      show_bye();
+    }
+  }
 
   # The banner.
   want = Math.Int(global.t / global.type_banner);
@@ -203,7 +247,22 @@ fun refresh() {
   for (i = global.shown_line; i < line; i++) global.ts[i].SetOpacity(1);
   if (line > global.shown_line) global.shown_line = line;
   done = global.t >= start + @TAG_LEN@ * global.type_line;
-  if (global.typed < global.n) {
+  if (global.bye) {
+    since = global.t - global.bye;
+    if (since >= 150) global.s.b1.SetOpacity(1);
+    if (since >= 450) global.s.b2.SetOpacity(1);
+    if (global.bye_mode == "reboot") w = px(@BYE_REBOOT_W@);
+    else w = px(@BYE_OFF_W@);
+    global.s.cur.SetImage(global.si.cur);
+    if (since < 450) {
+      global.s.cur.SetOpacity(0);
+    } else {
+      global.s.cur.SetX(global.b_left + w + global.tag_adv);
+      global.s.cur.SetY(global.p_y + px(@U@) * 3 / 2);
+      if (blink_on()) global.s.cur.SetOpacity(1);
+      else global.s.cur.SetOpacity(0);
+    }
+  } else if (global.typed < global.n) {
     global.s.cur.SetOpacity(0);
   } else if (!done) {
     global.s.cur.SetImage(global.si.curhot);

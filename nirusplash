@@ -20,7 +20,7 @@
 #
 # The first lines are plain sh: --version answers without bash (NIRUX checks
 # every program that way, also in minimal containers); the rest needs bash.
-VERSION=0.1.2
+VERSION=0.2.0
 case "${1:-}" in --version|version) printf 'nirusplash %s\n' "$VERSION"; exit 0 ;; esac
 if [ -z "${BASH_VERSION:-}" ]; then
   command -v bash >/dev/null 2>&1 || { echo 'nirusplash: bash is needed' >&2; exit 1; }
@@ -41,6 +41,7 @@ PLY_THEMES=${NIRUSPLASH_PLYMOUTH_THEMES:-/usr/share/plymouth/themes}
 PLY_DIR=$PLY_THEMES/nirux
 PLY_CONF=${NIRUSPLASH_PLYMOUTH_CONF:-/etc/plymouth/plymouthd.conf}
 VOID_QUIT=/etc/runit/core-services/99-nirusplash.sh
+VOID_BYE=/etc/runit/shutdown.d/15-nirusplash.sh
 DRACUT_CONF=/etc/dracut.conf.d/90-nirusplash.conf
 GRUB_D_SCRIPT=${NIRUSPLASH_GRUB_D:-/etc/grub.d}/06_nirusplash
 MARK_BEGIN='# >>> nirusplash (managed block; "nirusplash remove" takes it out)'
@@ -434,6 +435,32 @@ write_void_quit() {
   mv "$VOID_QUIT.nirusplash-new" "$VOID_QUIT"
 }
 
+# Void has no plymouth-poweroff service either: stage 3 starts the splash in
+# shutdown mode once the services (and X) have stopped. systemd machines use
+# the plymouth-poweroff and plymouth-reboot units that come with Plymouth.
+write_void_bye() {
+  [ "$OS" = void ] || return 0
+  [ -d /etc/runit/shutdown.d ] || return 0
+  { say '# nirusplash: the NIRUX goodbye while the system stops (sourced by stage 3).'
+    say 'if [ -z "$IS_CONTAINER" ] && command -v plymouthd >/dev/null 2>&1 &&'
+    say '   grep -qw splash /proc/cmdline 2>/dev/null && ! plymouth --ping 2>/dev/null; then'
+    say '  # --no-daemon in the background keeps it in this session, which the'
+    say '  # TERM and KILL round of 70-pkill.sh spares.'
+    say '  plymouthd --mode=shutdown --no-daemon >/dev/null 2>&1 &'
+    say '  for _nirusplash in 1 2 3 4 5 6 7 8 9 10; do'
+    say '    plymouth --ping 2>/dev/null && break'
+    say '    sleep 0.1'
+    say '  done'
+    say '  plymouth show-splash 2>/dev/null'
+    say '  [ -x /etc/runit/reboot ] && plymouth change-mode --reboot 2>/dev/null'
+    say '  unset _nirusplash'
+    say 'fi'
+  } > "$VOID_BYE.nirusplash-new"
+  if cmp -s "$VOID_BYE.nirusplash-new" "$VOID_BYE"; then rm -f "$VOID_BYE.nirusplash-new"; return 0; fi
+  [ -e "$VOID_BYE" ] || undo_push "rm -f '$VOID_BYE'"
+  mv "$VOID_BYE.nirusplash-new" "$VOID_BYE"
+}
+
 # dracut (Void): ask for the plymouth module, so a host-only initramfs never
 # leaves it out.
 write_dracut_conf() {
@@ -608,6 +635,7 @@ install_cmd() {
         changed_ply=1
       fi
       write_void_quit
+      write_void_bye
       write_dracut_conf
       arch_hook
       kernel=$(newest_kernel)
@@ -689,7 +717,7 @@ remove_cmd() {
     restore_original "$PLY_CONF"
     rm -rf "$PLY_DIR"
   fi
-  rm -f "$VOID_QUIT" "$DRACUT_CONF"
+  rm -f "$VOID_QUIT" "$VOID_BYE" "$DRACUT_CONF"
   local w
   for w in $(state_get uki_cmdline_added); do
     [ -f "$UKI_CMDLINE" ] && sed -i "s/[[:space:]]$w\([[:space:]]\|$\)/\1/" "$UKI_CMDLINE"
@@ -764,7 +792,10 @@ doctor_cmd() {
     else
       grep -q 'splash' "$GRUB_DIR/grub.cfg" 2>/dev/null && ok 'kernel command line has splash' || no 'kernel command line has no splash'
     fi
-    if [ "$OS" = void ]; then [ -f "$VOID_QUIT" ] && ok 'splash stops before the login screen' || no "missing $VOID_QUIT"; fi
+    if [ "$OS" = void ]; then
+      [ -f "$VOID_QUIT" ] && ok 'splash stops before the login screen' || no "missing $VOID_QUIT"
+      [ -f "$VOID_BYE" ] && ok 'goodbye splash while the system stops' || no "missing $VOID_BYE"
+    fi
   else
     hm 'no splash (text boot)'
   fi

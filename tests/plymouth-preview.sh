@@ -46,6 +46,16 @@ xdotool key Return
 shot 0.6 08-working
 plymouth quit
 sleep 0.5
+# The goodbye: shutting down, then the same daemon told it is a restart.
+plymouthd --no-daemon --debug --debug-file=/out/plymouthd-bye.log --mode=shutdown --kernel-command-line="quiet splash" --tty=$(tty) >/dev/null 2>&1 &
+sleep 1.5
+plymouth show-splash
+shot 0.2 09-bye-start
+shot 1.2 10-shutdown
+plymouth change-mode --reboot
+shot 0.6 11-reboot
+plymouth quit
+sleep 0.5
 chmod -R a+rw /out
 '
 ls "$OUT"; cat "$OUT/answer1" "$OUT/answer2"

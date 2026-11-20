@@ -399,6 +399,11 @@ def plymouth_theme(out, glyphs, lay, pal, template):
     text_png(t, working, [muted, muted, accent, accent, muted, muted] + [muted] * (len(working) - 6), out / "working.png")
     fail = "[ fail ] wrong password, try again"
     text_png(t, fail, [muted, muted] + [err] * 4 + [muted] * (len(fail) - 6), out / "fail.png")
+    # Shutting down and restarting: two status lines under the line.
+    bye = {"bye-closed": "[ ok ] session closed", "bye-off": "[ .. ] powering off", "bye-reboot": "[ .. ] restarting"}
+    for name, text in bye.items():
+        text_png(t, text, [muted, muted, accent, accent, muted, muted] + [muted] * (len(text) - 6), out / f"{name}.png")
+    bye_w = max(t.width(text) for text in bye.values()) + 2 * t.adv
 
     hashes = [(r, c) for r, row in enumerate(BANNER) for c, ch in enumerate(row) if ch == "#"]
     gap = u * 3 // 4
@@ -415,6 +420,8 @@ def plymouth_theme(out, glyphs, lay, pal, template):
         "GAP": gap, "U": u,
         "TAG_W": lay.tag_w, "TAG_ADV": t.adv, "TAG_LEN": len(TAGLINE), "TAG_H": t.height,
         "PROMPT_W": t.width(prompt),
+        "BYE_W": bye_w,
+        "BYE_OFF_W": t.width(bye["bye-off"]), "BYE_REBOOT_W": t.width(bye["bye-reboot"]),
         "N": len(hashes),
         "HASH_SET": "\n".join(f"global.hr[{i}] = {r}; global.hc[{i}] = {c};" for i, (r, c) in enumerate(hashes)),
     }
@@ -429,7 +436,7 @@ def plymouth_theme(out, glyphs, lay, pal, template):
     (out / "nirux.plymouth").write_text(
         "[Plymouth Theme]\n"
         "Name=NIRUX\n"
-        "Description=NIRUX: the banner typed in, a password prompt in the same style\n"
+        "Description=NIRUX: the banner typed in, a password prompt in the same style, a calm goodbye\n"
         "ModuleName=script\n\n"
         "[script]\n"
         "ImageDir=/usr/share/plymouth/themes/nirux\n"
